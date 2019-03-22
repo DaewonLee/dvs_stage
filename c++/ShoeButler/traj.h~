@@ -1,0 +1,17 @@
+#include <stdlib.h>
+#include <stdio.h>
+#include <cmath>
+
+
+class DVS_trajectory
+{
+public:
+	DVS_trajectory();
+	~DVS_trajectory(){};
+	
+	
+	float sample(float t, float freq);
+	
+
+
+};
