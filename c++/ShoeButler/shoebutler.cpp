@@ -10,6 +10,11 @@
 #include "saictime.h"
 #include "shm.h"
 #include "traj.h"
+#include <assert.h>
+#include "cyusb.h"
+#include <ctype.h>
+#include <getopt.h>
+#include <cmath>
 
 #define STDIN_FILENO 					0
 #define ADDR_PRO_TORQUE_ENABLE          64                 // Control table address is different in Dynamixel model
@@ -18,6 +23,14 @@
 #define ADDR_PRO_PRESENT_VELOCITY       128			// 4 Bytes
 #define ADDR_PRO_PRESENT_PWM    		124			// 2 Bytes
 #define ADDR_PRO_PRESENT_CURRENT        126			// 2 Bytes
+
+#define ADDR_PRO_GOAL_VELOCITY 			104			// 4 Bytes
+#define ADDR_PRO_OPERATING_MODE			11			// 1 Byte
+#define ADDR_PRO_VELOCITY_LIMIT         44			// 4 Bytes
+
+#define VELOCITY_MODE	                1
+#define POSITION_MODE	                3
+#define EXTENDED_POSITION_MODE			4
 
 #define ADDR_PRO_Position_P_Gain		84 			// 2 Bytes
 
@@ -35,7 +48,7 @@
 
 #define NUM_OF_MOTORS					2
  
-#define BAUDRATE                        115200
+#define BAUDRATE                        3000000
 #define DEVICENAME                      "/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FT2GXCUN-if00-port0"      // Check 
 
 #define TORQUE_ENABLE                   1                   // Value for enabling the torque
@@ -45,7 +58,7 @@
 
 #define ESC_ASCII_VALUE                 0x1b
 
-#define NUM_THREADS 					3
+#define NUM_THREADS 					5
 
 bool SYSTEM_RUN = true;
 bool new_control = true;
@@ -57,6 +70,394 @@ pthread_mutex_t mutex;
 CShm recv("/robot_input", 4096);
 CShm send("/robot_output", 4096);
 
+///////////
+
+char sprintf_buffer[200000000];
+int sprintf_buffer_loc = 0;
+double time_current = 0.;
+
+bool run_dvs = true;
+
+//////////////////////////////DVS SRART////////////////////////////////
+
+
+static const char * program_name;
+static const char *const short_options = "?hdsl:";
+static const struct option long_options[] = {
+		{ "help",		0,		NULL,		'h'},
+		{ "load",		1,		NULL,		'l',},
+		{ "stream",		1,		NULL,		's',},
+		{ "debug",		1,		NULL,		'd',},
+		{ NULL,			0,		NULL,		 0}
+};
+
+static int next_option;
+
+static void print_usage(FILE *stream, int exit_code)
+{
+	fprintf(stream, "Usage: %s options\n", program_name);
+	fprintf(stream, 
+		"  -h  --help        Display this usage information.\n"
+		"  -l  --load        filename Load I2C script.\n"
+		"  -s  --stream      Stream data.\n"
+		"  -d  --debug       Print debug information.\n");
+
+	exit(exit_code);
+}
+
+static FILE *fp = stdout;
+static int timeout_provided;
+static int timeout = 1000;
+static int debug = false;
+static cyusb_handle *h1 = NULL;
+
+const int buflen = 1024;
+const int I2C_VALUE_LEN = 2;
+const int I2C_SLAVE_ADDR = 0x60;	//96;	// 0x60
+
+const int	I2C_SLAVE_ADDR_DVSL = 0x20;
+const int	I2C_SLAVE_ADDR_DVSR = 0x30;
+const int	I2C_SLAVE_ADDR_D2FX = 0x40;
+const int	I2C_SLAVE_ADDR_M2PR = 0x1A;
+const int	I2C_SLAVE_ADDR_M2PL = 0x1C;
+const int	I2C_VALUE_LEN_DVSL = 1;
+const int	I2C_VALUE_LEN_DVSR = 1;
+const int	I2C_VALUE_LEN_D2FX = 1;
+const int	I2C_VALUE_LEN_M2PR = 2;
+const int	I2C_VALUE_LEN_M2PL = 2;
+
+struct Node {
+	void *data;
+	int len;
+	struct Node* next;
+};
+struct Node* front = NULL;
+struct Node* rear = NULL;
+pthread_mutex_t queue_mutex;
+
+CTime global_timer;
+
+static void validate_inputs(void)
+{
+	if ( (timeout_provided) && (timeout < 0) ) {
+		fprintf(stderr,"Must provide a positive value for timeout in seconds\n");
+		print_usage(stdout, 1);
+	}
+}
+
+int I2cSlaveAddr (int index) {
+	switch(index){
+		case 0 : return(I2C_SLAVE_ADDR_D2FX);
+		case 1 : return(I2C_SLAVE_ADDR_DVSL);
+		case 2 : return(I2C_SLAVE_ADDR_DVSR);
+		case 3 : return(I2C_SLAVE_ADDR_M2PL);
+		case 4 : return(I2C_SLAVE_ADDR_M2PR);
+		default : return(I2C_SLAVE_ADDR_D2FX);
+	}
+}
+
+int I2cValueLen (int slvAddr) {
+	switch(slvAddr){
+		case I2C_SLAVE_ADDR_D2FX : return(I2C_VALUE_LEN_D2FX);
+		case I2C_SLAVE_ADDR_DVSL : return(I2C_VALUE_LEN_DVSL);
+		case I2C_SLAVE_ADDR_DVSR : return(I2C_VALUE_LEN_DVSR);
+		case I2C_SLAVE_ADDR_M2PL : return(I2C_VALUE_LEN_M2PL);
+		case I2C_SLAVE_ADDR_M2PR : return(I2C_VALUE_LEN_M2PR);
+		default : return(I2C_VALUE_LEN_D2FX);
+	}
+}
+
+int readI2cReg(int slvAddr, int addr)
+{
+	int r;
+	unsigned char buf[I2C_VALUE_LEN];
+
+	int	I2c_Value_Len = I2cValueLen (slvAddr);
+
+	r = cyusb_control_transfer(h1, 0xC0, 0xBB, slvAddr, addr, buf, I2c_Value_Len, timeout);
+
+	if (r != I2c_Value_Len ) {
+		printf("Error reading I2C register\n");
+			return -1;
+	}
+
+	if (I2c_Value_Len == 1) {
+		r = (int) buf[0];
+	} else {
+		r = (int)(buf[0] << 8) + (int)buf[1];
+	}
+
+	if (debug) printf("[I] readI2cReg(%d,%d)=%d\n", slvAddr, addr, r);
+
+	return r;
+}
+
+int writeI2cReg(int slvAddr, int addr, int val)
+{
+	int r;
+	unsigned char buf[I2C_VALUE_LEN];
+
+	if (debug) printf("[I] writeI2cReg(%X,%X,%X)\n", slvAddr, addr, val);
+
+	int	I2c_Value_Len = I2cValueLen (slvAddr);
+
+	if (I2c_Value_Len == 1) {
+		buf[0] = val & 0xff;
+	} else {
+		buf[1] = val & 0xff;
+		buf[0] = (val >> 8) & 0xff;
+	}
+
+	r = cyusb_control_transfer(h1, 0x40, 0xBA, slvAddr, addr, buf, I2c_Value_Len, timeout);
+
+	if (r != I2c_Value_Len ) {
+		printf("Error writing I2C register\n");
+			return -1;
+	}
+
+	return 0;
+}
+
+int htoi(char s[], int *i)
+{
+	int hexdigit;
+	int n = 0;
+	char c;
+
+	while (true) {
+		c = s[*i];
+
+		if(c >='0' && c <='9')
+			hexdigit = c - '0';
+		else if(c >='a' && c <='f')
+			hexdigit = c -'a' + 10;
+		else if(c >='A' && c <='F')
+			hexdigit = c -'A' + 10;
+		else
+			return n;
+
+		n = 16 * n + hexdigit;
+
+		*i = *i + 1;
+	}
+}
+
+int parseString(char *s, int *slvAddr, int *adr, int *val) {
+	int i = 0;
+	int *dst;
+	int mode = 10, ret;
+
+	dst = slvAddr;
+	while (true) {
+		switch (tolower(s[i])) {
+			case 0   : return mode;
+			case '\n': return mode;
+			case '/' : return mode;
+
+			case ' ' : break;
+			case '\t': break;
+			case ':' : break;
+			case '=' : break;
+
+			case 'w':
+				if (tolower(s[i+1]) == 'a' && tolower(s[i+2]) == 'i' && tolower(s[i+3]) == 't') {
+					i = i + 3;
+					mode = 20;
+					dst = val;
+					break;
+				} else {
+					return -1;
+				}
+
+			case '0':
+			case '1':
+			case '2':
+			case '3':
+			case '4':
+			case '5':
+			case '6':
+			case '7':
+			case '8':
+			case '9':
+			case 'a':
+			case 'b':
+			case 'c':
+			case 'd':
+			case 'e':
+			case 'f':
+				*dst = htoi(s, &i);
+				if (debug) printf("[I] Mode(%d): Value(%X) : (%X, %X, %X)\n", mode, *dst, *slvAddr, *adr, *val);
+				switch (mode) {
+					case 10 :
+						mode = 11;
+						dst = adr;
+						break;
+					case 11 :
+						mode = 12;
+						dst = val;
+						break;
+					case 12 :
+						mode = 1;
+						break;
+					case 20 :
+						mode = 2;
+						break;
+					default :
+						break;
+				}
+				break;
+
+			default: return -1;
+		}
+		i++;
+	}
+}
+
+void loadScript(char *s)
+{
+	int slvAddr, adr, val;
+
+	if (debug) printf("[I] loadScript(%s)\n", s);
+
+	const int buflen = 1000;
+	char buf[buflen];
+	FILE * file;
+
+	file = fopen(s , "r");
+	if (!file) {
+		printf("Error opening file %s\n", s);
+		return;
+	}
+
+	while (fgets(buf, buflen, file)!=NULL) {
+
+		//if (debug) printf("%s",buf);
+
+		switch (parseString(buf, &slvAddr, &adr, &val)) {
+			case 1:
+				if (debug) printf("[I] I2C (%X,%X,%X)\n", slvAddr, adr, val);
+				writeI2cReg(slvAddr, adr, val);
+				break;
+			case 2:
+				if (debug) printf("[I] WAIT (%d)\n", val);
+				//usleep(val*1000);
+				break;
+			default: continue;
+		}
+	}
+
+	fclose(file);
+}
+
+int ahtoi(char s[])
+{
+	int hexdigit;
+	int inhex = 1;
+	int n = 0;
+	int i = 0;
+
+	if (s[i] == '0')
+	{
+		++i;
+		if(s[i] == 'x' || s[i] == 'X') ++i;
+		else return atoi(s);
+	} else return atoi(s);
+
+	return htoi(s, &i);
+}
+
+void Enqueue(void *pkt, int len) {
+	pthread_mutex_lock(&queue_mutex);
+
+	struct Node* temp = 
+		(struct Node*)malloc(sizeof(struct Node));
+	temp->data = pkt;
+	temp->len = len;
+	temp->next = NULL;
+
+	if(front == NULL && rear == NULL){
+		front = rear = temp;
+	} else {
+		rear->next = temp;
+		rear = temp;
+	}
+
+	pthread_mutex_unlock(&queue_mutex);
+
+	if (debug) printf("[I] Enqueued packet, len=%d\n", len);
+}
+
+void *Dequeue(int *len) {
+
+	*len = 0;
+	void *data = NULL;
+	pthread_mutex_lock(&queue_mutex);
+	int wha=0;
+
+
+	struct Node* temp = front;
+	if(front == NULL) {
+		//printf("Queue is Empty\n");
+		wha=1;
+			//return NULL;
+		
+	} else {
+		wha=0;
+		if(front == rear) {
+			data = front->data;
+			*len = front->len;
+			front = rear = NULL;
+		} else {
+			front = front->next;
+			data = front->data;
+			*len = front->len;
+		}
+		free(temp);
+	}
+	pthread_mutex_unlock(&queue_mutex);
+
+	if (wha==1){
+	return NULL;
+	}
+	return data;
+}
+
+void DecodePacket(unsigned char *pkt, int pktlen, FILE *fp) {
+//	printf("he");
+	//FILE *fifi = fopen("multi_T","wb");
+	if (pktlen < 4) return;	// Unexpected invalid packet
+	if (pktlen % 4) pktlen = (pktlen / 4) * 4;
+
+	for (int i = 0; i < pktlen; i += 4) {
+        	
+		for (int j=0; j < 4; j+=1){
+			//printf("%p",pkt+(i+j));
+            		fwrite((pkt+(i+j)),sizeof(unsigned char),1,fp);
+            	}
+		
+		switch (pkt[i]) {
+
+			case (0x66) :
+				printf ("T");
+				break;
+			case (0x99) :
+				printf ("G");
+				break;
+			case (0xcc) :
+				printf ("E");
+				break;
+			default :
+				break;
+
+		}
+
+	}
+	//printf (" %d\n", pktlen/4);
+
+}
+
+
+////////////////////////////////DVS END/////////////////////////////
 
 
 
@@ -91,20 +492,56 @@ int print_results(int dxl_comm_result, int dxl_error, int id, dynamixel::PacketH
 	return 1;
 }
 
+void SatVal(int upper, int lower, int* val){
+
+	if (*val > upper)
+	    *val = upper;
+	else if (*val < lower)
+	    *val = lower;
+
+} 
+
 
 /////////////////////////  THREADS  BIGIN   ////////////////////////////////////////
 
-void *buffer(void *thread_id)
+void *trajectory(void *thread_id)
 {
 	CTime t_traj;
 	DVS_trajectory traj;
+	float pan_limit_upper = 21; //degree
+	float tilt_limit_upper =4;
+	float pan_limit_lower = -16; //degree
+	float tilt_limit_lower =-7;  
+
+	float pan_Hz = 0.3; //Hz
+	float tilt_Hz = 0.2;  
+
+	float pan_degree = 25.; //degree
+	float tilt_degree = 5.;
+
+	// pan limit: -16, 21 deg
+	// tile limit: -7, 4 deg
+
 	while(SYSTEM_RUN)
 	{
-		//dxl_goal_position[0] = 2000 + traj.sample(t_traj.get_time(), 1.) * 200;
-		dxl_goal_position[0] = 2000 + traj.random_sample(t_traj.get_time()) * 200;
-		dxl_goal_position[1] = 2000 + traj.random_sample(t_traj.get_time()) * 200;
-		printf("dxl_goal_position[1]: %f\n",dxl_goal_position[1]);
-		usleep(100000);
+	
+		dxl_goal_position[0] = 2048 + traj.sample(t_traj.get_time(),pan_Hz) * pan_degree/0.088;
+		dxl_goal_position[1] = 2048 + traj.sample(t_traj.get_time(),tilt_Hz) * tilt_degree/0.088;
+
+		//printf("dxl_goal_position[0]: %d\n", dxl_goal_position[0]);
+
+		
+
+		//dxl_goal_position[0] = 2000 + traj.random_sample(t_traj.get_time()) * 200;
+		//dxl_goal_position[1] = 2000 + traj.random_sample(t_traj.get_time()) * 200;
+
+		SatVal(2048+(int)pan_limit_upper/0.088, 2048+(int)pan_limit_lower/0.088, &dxl_goal_position[0]);
+		SatVal(2048+(int)tilt_limit_upper/0.088, 2048+(int)tilt_limit_lower/0.088, &dxl_goal_position[1]);
+		//printf("dxl_goal_position[1]: %f\n",dxl_goal_position[1]);
+		
+		usleep((int)(abs((1000*traj.randn(0.,5.))+200000)));
+		//usleep(-1);
+		if(t_traj.get_time()>45) SYSTEM_RUN = false;
 	}
 	
     pthread_exit(NULL);
@@ -116,25 +553,26 @@ void *buffer(void *thread_id)
 void *command_input(void *thread_id)
 {
 	unsigned char command_key;
-	while(SYSTEM_RUN)
+	//while(SYSTEM_RUN)
+	while(0)
 	{
-		command_key = getch();
+		command_key = getch();  
 		if(command_key == 'q') SYSTEM_RUN = false;
 		else if(command_key == 'a')
 		{
-			dxl_goal_position[0] -= 600;
+			dxl_goal_position[0] -= 10;
 		}
 		else if(command_key == 'd')
 		{
-			dxl_goal_position[0] += 600;
+			dxl_goal_position[0] += 10;
 		}
 		else if(command_key == 'w')
 		{
-			dxl_goal_position[1] -= 600;
+			dxl_goal_position[1] -= 10;
 		}
 		else if(command_key == 's')
 		{
-			dxl_goal_position[1] += 600;
+			dxl_goal_position[1] += 10;
 		}
 
 
@@ -148,9 +586,11 @@ void *command_input(void *thread_id)
 void *motor_control(void *thread_id)
 {
 
-  CTime time;
   dynamixel::PortHandler *portHandler = dynamixel::PortHandler::getPortHandler(DEVICENAME);
   dynamixel::PacketHandler *packetHandler = dynamixel::PacketHandler::getPacketHandler(PROTOCOL_VERSION);
+
+  FILE *file;
+  file = fopen("motor_data.txt","w");
 
   // Initialize GroupBulkWrite instance
   dynamixel::GroupBulkWrite groupBulkWrite(portHandler, packetHandler);
@@ -199,6 +639,46 @@ void *motor_control(void *thread_id)
 		return 0;
 	}
 
+	// Disable Dynamixel Torque
+
+	for (int i = 0; i<NUM_OF_MOTORS; i++)
+	{
+		dxl_comm_result = packetHandler->write1ByteTxRx(portHandler, dxl_id[i], ADDR_PRO_TORQUE_ENABLE, TORQUE_DISABLE, &dxl_error);
+		if (print_results(dxl_comm_result, dxl_error,  dxl_id[i], packetHandler))
+		{
+			printf("Dynamixel[%d] has been successfully disables \n",dxl_id[i]);
+		}	
+		else
+		{
+			printf("Dynamixel[%d]: Failed to disable!! \n",dxl_id[i]);
+		}	
+	}
+
+	
+
+	for (int i = 0; i<NUM_OF_MOTORS; i++)
+	{
+		dxl_comm_result = packetHandler->write1ByteTxRx(portHandler, dxl_id[i], ADDR_PRO_OPERATING_MODE , POSITION_MODE, &dxl_error);
+		if (print_results(dxl_comm_result, dxl_error,  dxl_id[i], packetHandler))
+		{
+			printf("Dynamixel[%d] is velocity control mode! \n",dxl_id[i]);
+		}	
+		else
+		{
+			printf("Dynamixel[%d]: Failed to enter velocity control mode \n",dxl_id[i]);
+		}	
+		//usleep(10000);
+		dxl_comm_result = packetHandler->write4ByteTxRx(portHandler, dxl_id[i], ADDR_PRO_VELOCITY_LIMIT , 600 , &dxl_error);
+		if (print_results(dxl_comm_result, dxl_error,  dxl_id[i], packetHandler))
+		{
+			printf("Dynamixel[%d] velocity limit set ! \n",dxl_id[i]);
+		}	
+		else
+		{
+			printf("Dynamixel[%d]: Failed to set velocity limit \n",dxl_id[i]);
+		}
+	}
+
 	// Enable Dynamixel Torque
 
 	for (int i = 0; i<NUM_OF_MOTORS; i++)
@@ -214,10 +694,6 @@ void *motor_control(void *thread_id)
 		}	
 	}
 
-	//dxl_comm_result = packetHandler->write2ByteTxRx(portHandler, dxl_id[0], ADDR_PRO_Position_P_Gain, 100, &dxl_error);
-		
-
-
 	for (int i = 0; i<NUM_OF_MOTORS; i++)
 	{
 		dxl_addparam_result = groupBulkRead.addParam(dxl_id[i], ADDR_PRO_BULK_READ, LEN_PRO_BULK_READ);
@@ -227,22 +703,21 @@ void *motor_control(void *thread_id)
 			return 0;
 		}
 	}
-
-
+//usleep(2000000);
 
 	while(SYSTEM_RUN)
 	{	
-
+		printf("system rate: %f (Hz)\n",1./global_timer.get_delta_t());
 		dxl_comm_result = groupBulkRead.txRxPacket();
-		for (int i=0; i<NUM_OF_MOTORS; i++)
-		{
-			dxl_getdata_result = groupBulkRead.isAvailable(dxl_id[i], ADDR_PRO_BULK_READ, LEN_PRO_BULK_READ);
-		      if (dxl_getdata_result != true)
-		      {
-			fprintf(stderr, "[ID:%03d] groupBulkRead getdata failed\n", dxl_id[i]);
-			return 0;
-		      }
-		}
+		//for (int i=0; i<NUM_OF_MOTORS; i++)
+		//{
+		//	dxl_getdata_result = groupBulkRead.isAvailable(dxl_id[i], ADDR_PRO_BULK_READ, LEN_PRO_BULK_READ);
+		//     if (dxl_getdata_result != true)
+		//      {
+		//	fprintf(stderr, "[ID:%03d] groupBulkRead getdata failed\n", dxl_id[i]);
+		//	return 0;
+		//      }
+		//}
 		for (int i=0; i<NUM_OF_MOTORS; i++)
 		{
 			int res = groupBulkRead.getBulkData(dxl_id[i], ADDR_PRO_BULK_READ, LEN_PRO_BULK_READ, dxl_present_bulk);
@@ -251,9 +726,7 @@ void *motor_control(void *thread_id)
 			memcpy(&dxl_present_current[i], dxl_present_bulk+2,2);
 			memcpy(&dxl_present_velocity[i], dxl_present_bulk+4,4);
 			memcpy(&dxl_present_position[i], dxl_present_bulk+8,4);
-			
-			//memcpy(&dxl_goal_position[i], dxl_present_bulk2+8,4);
-			
+
 
 		}
 
@@ -267,39 +740,67 @@ void *motor_control(void *thread_id)
 			}
 
 		}
-		groupBulkWrite.clearParam();
-		dxl_comm_result = groupBulkRead.txRxPacket();
 
-		for (int i=0; i<NUM_OF_MOTORS; i++)
+		if(0)	
 		{
-			dxl_getdata_result = groupBulkRead.isAvailable(dxl_id[i], ADDR_PRO_BULK_READ, LEN_PRO_BULK_READ);
-			if (dxl_getdata_result != true)
+			for (int i = 0; i<NUM_OF_MOTORS; i++)
 			{
-				fprintf(stderr, "[ID:%03d] groupBulkRead getdata failed", dxl_id[i]);
-				return 0;
+				dxl_comm_result = packetHandler->write4ByteTxRx(portHandler, dxl_id[i], ADDR_PRO_GOAL_VELOCITY, 200, &dxl_error);
+				//dxl_comm_result =packetHandler->write4ByteTxRx(portHandler, DXL_ID, ADDR_PRO_GOAL_VELOCITY, DXL_GOAL_VELOCITY, &dxl_error);
+				printf("here\n");
 			}
+
 		}
-		int8_t temp[255];
+
 		
-		for (int i=0; i<NUM_OF_MOTORS; i++)
-		{
-			int res = groupBulkRead.getBulkData(dxl_id[i], ADDR_PRO_BULK_READ, LEN_PRO_BULK_READ, dxl_present_bulk);
-			memcpy(&dxl_current_position[i], dxl_present_bulk+8,4);
+		//groupBulkWrite.clearParam();
+		//dxl_comm_result = groupBulkRead.txRxPacket();
+
+		//for (int i=0; i<NUM_OF_MOTORS; i++)
+		//{
+		//	dxl_getdata_result = groupBulkRead.isAvailable(dxl_id[i], ADDR_PRO_BULK_READ, LEN_PRO_BULK_READ);
+		//	if (dxl_getdata_result != true)
+		//	{
+		//		fprintf(stderr, "[ID:%03d] groupBulkRead getdata failed", dxl_id[i]);
+		//		return 0;
+		//	}
+		//}
+		time_current = global_timer.get_time();
+		//int8_t temp[255];
+		
+		//for (int i=0; i<NUM_OF_MOTORS; i++)
+		//{
+		//	int res = groupBulkRead.getBulkData(dxl_id[i], ADDR_PRO_BULK_READ, LEN_PRO_BULK_READ, dxl_present_bulk);
+		//	memcpy(&dxl_current_position[i], dxl_present_bulk+8,4);
 			//memcpy(temp+i*12, dxl_present_bulk, 12);
 
+		//}
+
+		//printf("%fs     pwm,    torque,   velocity,   position\n",global_timer.get_time());
+		//printf("[0]: %d pwm,  %d,  %f deg/s,  %f deg\n",(signed short int)dxl_present_pwm[0], (signed short int)dxl_present_current[0], dxl_present_velocity[0]*0.229*6., (dxl_present_position[0]-2048)*0.088);
+		//printf("[1]: %d pwm,  %d,  %f deg/s,  %f deg\n",(signed short int)dxl_present_pwm[1], (signed short int)dxl_present_current[1], dxl_present_velocity[1]*0.229*6., (dxl_present_position[1]-2048)*0.088);
+		//printf("time: %f\n",global_timer.get_time());
+		if(sprintf_buffer_loc < sizeof(sprintf_buffer))
+        {
+            int sprintf_size = sprintf(sprintf_buffer+sprintf_buffer_loc,"\
+            %e %e %e %e %e \n",
+            
+            time_current, dxl_present_velocity[0]*0.229*6., dxl_present_velocity[1]*0.229*6., (dxl_present_position[0]-2048)*0.088, (dxl_present_position[1]-2048)*0.088 );
+            sprintf_buffer_loc+=sprintf_size;
+        }
+        else if(sprintf_buffer_loc >= sizeof(sprintf_buffer))
+        {
+            printf("Warning: sprintf_buffer is full! \n");
 		}
 
-		printf("     pwm,    torque,   velocity,   position\n");
-		printf("[0]: %d pwm,  %d,  %f deg/s,  %f deg\n",(signed short int)dxl_present_pwm[0], (signed short int)dxl_present_current[0], dxl_present_velocity[0]*0.229*6., (dxl_present_position[0]-2048)*0.088);
-		printf("[1]: %d pwm,  %d,  %f deg/s,  %f deg\n",(signed short int)dxl_present_pwm[1], (signed short int)dxl_present_current[1], dxl_present_velocity[1]*0.229*6., (dxl_present_position[1]-2048)*0.088);
 
-		//send.write8(temp,60);
-		//usleep(10000);
-
-
-
-													
 	}
+	printf("======================================================================================= I'M DYING HERE\n\n\n\n\n\n");
+    printf("Opening text file.....  \n");
+    printf("Saving buffer to a file.....  \n");
+    fwrite(sprintf_buffer, 1, sprintf_buffer_loc,file);
+    printf("free buffer file.....  \n");
+	fclose(file);
 
   // Disable Dynamixel Torque
 
@@ -316,12 +817,156 @@ void *motor_control(void *thread_id)
 
 }
 
+
+// dvs thread 
+
+static void *reader(void *thread_id)
+{
+	int r;
+	void *buf;
+	int transferred = 0;
+	int nPkt = 0;
+	FILE *fififi;
+  	fififi = fopen("initial_time.txt","w");
+  	//enum { SIZE = 5 };
+  	char buf_time[50];
+  	double current_time_reader = global_timer.get_time();
+	while (SYSTEM_RUN && run_dvs) {
+
+		buf = malloc(buflen);
+		r = cyusb_bulk_transfer(h1, 0x81, (unsigned char*)buf, buflen, &transferred, timeout * 1000);
+		if ( r == 0 ) {
+			if (debug) printf("[I] Received packet %d, len=%d\n", nPkt, buflen);
+			Enqueue(buf, buflen);
+			nPkt++;
+			continue;
+		} else {
+			cyusb_error(r);
+			cyusb_close();
+			return NULL;
+		}
+	}
+	//printf("time stamp: %f\n",current_time_reader);
+	sprintf (buf_time, "%f\n", current_time_reader);
+	fwrite(buf_time, 1, sizeof(double),fififi);
+    pthread_exit(NULL);
+}
+
+// dvs thread
+
+static void *processor(void *thread_id)
+{
+	int r;
+	unsigned char *buf;
+	//void *buf
+	int transferred = 0;
+	int nPkt = 0;
+	int pktlen;
+	bool sus_processor=true;
+	printf("IS IT");
+	FILE* fifi = fopen("dvsnewfi","w");
+	
+	if (debug) printf("[I] Processor thread started\n");
+	//printf("time: %f\n",ctime.get_time());
+	while (SYSTEM_RUN || sus_processor) {
+		buf = (unsigned char *)Dequeue(&pktlen);
+		//buf = Dequeue(&pktlen);
+		if (buf!=NULL) {
+			// process
+			//if (1) printf("[I] Dequeued packet %d, len=%d\n", nPkt, pktlen);
+			DecodePacket(buf, pktlen, fifi);
+			//printf("%d\n",nPkt);	
+			//free(buf);
+			sus_processor=true;	
+			nPkt++;
+		}
+		else{
+			sus_processor=false;
+			//printf("sus pros\n");
+		}
+		//sleep(0);
+	}
+
+	fclose(fifi);
+	
+
+    pthread_exit(NULL);
+}
+
+
 /////////////////////////  THREADS  END   ////////////////////////////////////////
 
 int main(int argc, char **argv)
 {
 
+	int r;
+	char user_input = 'n';
+	pthread_t tidStream, tidProcess;
+	int slvAddr = 0, addr = 0;
+	int val = 0;
+	int cmd = 0;
+	char *filename;
+	//FILE *fifi = fopen("dvsfastdump.txt","w");
+	program_name = argv[0];
+
+	if (argc < 2) {
+		printf("here");
+		print_usage (stdout, 1);
+	}
+
+	if(run_dvs)
+	{
+
+		validate_inputs();
+
+		r = cyusb_open();
+		
+		if ( r < 0 ) {
+			printf("Error opening library\n");
+			return -1;
+		} else if ( r == 0 ) {
+			printf("No device found\n");
+			return 0;
+		}
+		if ( r > 1 ) {
+			printf("More than 1 devices of interest found. Disconnect unwanted devices\n");
+			return 0;
+		}
+
+		h1 = cyusb_gethandle(0);
+		if ( cyusb_getvendor(h1) != 0x04b4 ) {
+			printf("Cypress chipset not detected\n");
+			cyusb_close();
+			return 0;
+		}
+		r = cyusb_kernel_driver_active(h1, 0);
+		if ( r != 0 ) {
+			printf("kernel driver active. Exitting\n");
+			cyusb_close();
+			return 0;
+		}
+		r = cyusb_claim_interface(h1, 0);
+		if ( r != 0 ) {
+			printf("Error in claiming interface\n");
+			cyusb_close();
+			return 0;
+		}
+	}
+
 	
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 	pthread_t threads[NUM_THREADS];
 	pthread_attr_t attr;
@@ -339,19 +984,29 @@ int main(int argc, char **argv)
 	fifo_max_prio = sched_get_priority_max(SCHED_FIFO);
 	fifo_min_prio = sched_get_priority_min(SCHED_FIFO);
 
-	param.sched_priority = fifo_max_prio;
+	param.sched_priority = fifo_min_prio;
 	pthread_attr_setschedparam(&attr, &param);
 	pthread_create(&threads[numT++], &attr, motor_control, (void *) 0);
 
 	// Medium priority for vicon
 	param.sched_priority = (fifo_max_prio+fifo_min_prio)/2;
 	pthread_attr_setschedparam(&attr, &param);
-	pthread_create(&threads[numT++], &attr, buffer, (void *) 1);
+	pthread_create(&threads[numT++], &attr, trajectory, (void *) 1);
 
 	// Lower priority for vicon
 	param.sched_priority = fifo_min_prio;
 	pthread_attr_setschedparam(&attr, &param);
 	pthread_create(&threads[numT++], &attr, command_input, (void *) 2);
+
+	// dvs thread reader
+	param.sched_priority = fifo_max_prio;
+	pthread_attr_setschedparam(&attr, &param);
+	pthread_create(&threads[numT++], &attr, reader, (void *) 3);
+
+	// dvs thread process
+	param.sched_priority = fifo_max_prio;
+	pthread_attr_setschedparam(&attr, &param);
+	pthread_create(&threads[numT++], &attr, processor, (void *) 4);
 
 	// Wait for all threads to complete
 	for (int i = 0; i < numT; i++)
@@ -359,11 +1014,14 @@ int main(int argc, char **argv)
 		pthread_join(threads[i], NULL);
 		printf("joining %d thread\n", i);
 	}
+	printf("bye\n");
+	//cyusb_close();
 
 	printf("close destroy pthread attr\n");
 	pthread_attr_destroy(&attr);
 	printf("close destroying mutex\n");
 	pthread_mutex_destroy(&data_acq_mutex);
+	printf("you made it");
 	return 0;
 
 

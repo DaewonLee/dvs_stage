@@ -3,16 +3,20 @@
 DVS_trajectory::DVS_trajectory(){
 }
 
+
+//freq: Hz.
 float DVS_trajectory::sample(float t, float freq)
 {
 //	printf("t: %f\n\n",t);
-	return sin(t*freq);
+  double PI = 3.14159265359;
+	return sin(t*2.*PI*freq);
 }
 
 float DVS_trajectory::random_sample(float t)
 {
-//	printf("t: %f\n\n",t);
-	return sin(t*randn(0., 1.))*randn(1., 1.);
+	//printf("randn1: %f\n",randn(0.,1.));
+	//printf("randn2: %f\n\n",randn(0.,2.));
+	return (randn(0., 1.));
 }
 
 float DVS_trajectory::randn (float mu, float sigma)
@@ -21,7 +25,7 @@ float DVS_trajectory::randn (float mu, float sigma)
   static float X1, X2;
   static int call = 0;
  
-  if (call == 1)
+  if (call)
     {
       call = !call;
       return (mu + sigma * (double) X2);
