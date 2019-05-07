@@ -11,7 +11,7 @@
 #include "shm.h"
 #include "traj.h"
 #include <assert.h>
-#include "cyusb.h"
+//#include "cyusb.h"
 #include <ctype.h>
 #include <getopt.h>
 #include <cmath>
@@ -46,10 +46,10 @@
 // Protocol version
 #define PROTOCOL_VERSION                2.0                 // See which protocol version is used in the Dynamixel
 
-#define NUM_OF_MOTORS					2
+#define NUM_OF_MOTORS					1
  
 #define BAUDRATE                        3000000
-#define DEVICENAME                      "/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FT2GXCUN-if00-port0"      // Check 
+#define DEVICENAME                      "/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FT2KQC4K-if00-port0"      // Check 
 
 #define TORQUE_ENABLE                   1                   // Value for enabling the torque
 #define TORQUE_DISABLE                  0                   // Value for disabling the torque
@@ -62,7 +62,7 @@
 
 bool SYSTEM_RUN = true;
 bool new_control = true;
-int dxl_goal_position[NUM_OF_MOTORS] = {2048, 2048};         // Goal position
+int dxl_goal_position[NUM_OF_MOTORS] = {2048};         // Goal position
 int dxl_current_position[NUM_OF_MOTORS];         // Goal position
 pthread_mutex_t data_acq_mutex;
 pthread_cond_t data_acq_cv;
@@ -109,7 +109,7 @@ static FILE *fp = stdout;
 static int timeout_provided;
 static int timeout = 1000;
 static int debug = false;
-static cyusb_handle *h1 = NULL;
+
 
 const int buflen = 1024;
 const int I2C_VALUE_LEN = 2;
@@ -169,51 +169,12 @@ int I2cValueLen (int slvAddr) {
 
 int readI2cReg(int slvAddr, int addr)
 {
-	int r;
-	unsigned char buf[I2C_VALUE_LEN];
 
-	int	I2c_Value_Len = I2cValueLen (slvAddr);
-
-	r = cyusb_control_transfer(h1, 0xC0, 0xBB, slvAddr, addr, buf, I2c_Value_Len, timeout);
-
-	if (r != I2c_Value_Len ) {
-		printf("Error reading I2C register\n");
-			return -1;
-	}
-
-	if (I2c_Value_Len == 1) {
-		r = (int) buf[0];
-	} else {
-		r = (int)(buf[0] << 8) + (int)buf[1];
-	}
-
-	if (debug) printf("[I] readI2cReg(%d,%d)=%d\n", slvAddr, addr, r);
-
-	return r;
+	return 1;
 }
 
 int writeI2cReg(int slvAddr, int addr, int val)
 {
-	int r;
-	unsigned char buf[I2C_VALUE_LEN];
-
-	if (debug) printf("[I] writeI2cReg(%X,%X,%X)\n", slvAddr, addr, val);
-
-	int	I2c_Value_Len = I2cValueLen (slvAddr);
-
-	if (I2c_Value_Len == 1) {
-		buf[0] = val & 0xff;
-	} else {
-		buf[1] = val & 0xff;
-		buf[0] = (val >> 8) & 0xff;
-	}
-
-	r = cyusb_control_transfer(h1, 0x40, 0xBA, slvAddr, addr, buf, I2c_Value_Len, timeout);
-
-	if (r != I2c_Value_Len ) {
-		printf("Error writing I2C register\n");
-			return -1;
-	}
 
 	return 0;
 }
@@ -601,7 +562,7 @@ void *motor_control(void *thread_id)
 
 	int index = 0;
 	int dxl_comm_result = COMM_TX_FAIL;             // Communication result
-	int dxl_id[NUM_OF_MOTORS] = {5,6};
+	int dxl_id[NUM_OF_MOTORS] = {10};
 
 	bool dxl_addparam_result = false;               // addParam result
 	bool dxl_getdata_result = false;                // GetParam result
@@ -620,7 +581,7 @@ void *motor_control(void *thread_id)
 	}
 	else
 	{
-		printf("Failed to open the port!\n");
+		printf("Failed to open the port!@@@@\n");
 		printf("Press any key to terminate...\n");
 		getch();
 		return 0;
@@ -822,33 +783,7 @@ void *motor_control(void *thread_id)
 
 static void *reader(void *thread_id)
 {
-	int r;
-	void *buf;
-	int transferred = 0;
-	int nPkt = 0;
-	FILE *fififi;
-  	fififi = fopen("initial_time.txt","w");
-  	//enum { SIZE = 5 };
-  	char buf_time[50];
-  	double current_time_reader = global_timer.get_time();
-	while (SYSTEM_RUN && run_dvs) {
 
-		buf = malloc(buflen);
-		r = cyusb_bulk_transfer(h1, 0x81, (unsigned char*)buf, buflen, &transferred, timeout * 1000);
-		if ( r == 0 ) {
-			if (debug) printf("[I] Received packet %d, len=%d\n", nPkt, buflen);
-			Enqueue(buf, buflen);
-			nPkt++;
-			continue;
-		} else {
-			cyusb_error(r);
-			cyusb_close();
-			return NULL;
-		}
-	}
-	//printf("time stamp: %f\n",current_time_reader);
-	sprintf (buf_time, "%f\n", current_time_reader);
-	fwrite(buf_time, 1, sizeof(double),fififi);
     pthread_exit(NULL);
 }
 
@@ -856,38 +791,6 @@ static void *reader(void *thread_id)
 
 static void *processor(void *thread_id)
 {
-	int r;
-	unsigned char *buf;
-	//void *buf
-	int transferred = 0;
-	int nPkt = 0;
-	int pktlen;
-	bool sus_processor=true;
-	printf("IS IT");
-	FILE* fifi = fopen("dvsnewfi","w");
-	
-	if (debug) printf("[I] Processor thread started\n");
-	//printf("time: %f\n",ctime.get_time());
-	while (SYSTEM_RUN || sus_processor) {
-		buf = (unsigned char *)Dequeue(&pktlen);
-		//buf = Dequeue(&pktlen);
-		if (buf!=NULL) {
-			// process
-			//if (1) printf("[I] Dequeued packet %d, len=%d\n", nPkt, pktlen);
-			DecodePacket(buf, pktlen, fifi);
-			//printf("%d\n",nPkt);	
-			//free(buf);
-			sus_processor=true;	
-			nPkt++;
-		}
-		else{
-			sus_processor=false;
-			//printf("sus pros\n");
-		}
-		//sleep(0);
-	}
-
-	fclose(fifi);
 	
 
     pthread_exit(NULL);
@@ -913,57 +816,6 @@ int main(int argc, char **argv)
 		printf("here");
 		print_usage (stdout, 1);
 	}
-
-	if(run_dvs)
-	{
-
-		validate_inputs();
-
-		r = cyusb_open();
-		
-		if ( r < 0 ) {
-			printf("Error opening library\n");
-			return -1;
-		} else if ( r == 0 ) {
-			printf("No device found\n");
-			return 0;
-		}
-		if ( r > 1 ) {
-			printf("More than 1 devices of interest found. Disconnect unwanted devices\n");
-			return 0;
-		}
-
-		h1 = cyusb_gethandle(0);
-		if ( cyusb_getvendor(h1) != 0x04b4 ) {
-			printf("Cypress chipset not detected\n");
-			cyusb_close();
-			return 0;
-		}
-		r = cyusb_kernel_driver_active(h1, 0);
-		if ( r != 0 ) {
-			printf("kernel driver active. Exitting\n");
-			cyusb_close();
-			return 0;
-		}
-		r = cyusb_claim_interface(h1, 0);
-		if ( r != 0 ) {
-			printf("Error in claiming interface\n");
-			cyusb_close();
-			return 0;
-		}
-	}
-
-	
-
-
-
-
-
-
-
-
-
-
 
 
 
